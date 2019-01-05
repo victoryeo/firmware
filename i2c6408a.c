@@ -41,6 +41,7 @@
 #include <ti/drivers/GPIO.h>
 #include <ti/drivers/I2C.h>
 #include <ti/display/Display.h>
+#include <ti/drivers/timer/GPTimerCC26XX.h>
 
 /* Example/Board Header files */
 #include "Board.h"
@@ -63,10 +64,24 @@
 #define DELAY_US_1_5_BIT    ((SYSTEM_FREQ_HZ/BAUD_RATE) * 1.5)    // approx 62.5us
 #define DELAY_US_1_0_BIT    ((SYSTEM_FREQ_HZ/BAUD_RATE) * 1.0)
 #define DELAY_US_0_5_BIT    ((SYSTEM_FREQ_HZ/BAUD_RATE) * 0.5)
+#define DELAY_1_MS          ((SYSTEM_FREQ_HZ/BAUD_RATE) * 1.5 * 16)    // approx 1ms
 
 static Display_Handle display;
 uint8_t         txBuffer[1];
 uint8_t         rxBuffer[1];
+uint8_t         *txPtr;
+uint8_t         *rxPtr;
+uint8_t         uart_ready;
+
+// dummy tx command for testing
+uint8_t      txCmd[] = {
+  0x55,
+  0x56,
+  0x57,
+  0x58,
+  0x59,
+  0x60
+};
 
 void uart_delay(unsigned int delay) {
     unsigned int d;
@@ -85,20 +100,45 @@ uint8_t uart_read(I2C_Handle i2c) {
     i2cTransaction.slaveAddress = Board_TMP_ADDR;
     i2cTransaction.writeBuf = NULL;
     i2cTransaction.writeCount = 0;
+    i2cTransaction.readBuf = txBuffer;
+    i2cTransaction.readCount = 1;
+    status = I2C_transfer(i2c, &i2cTransaction);
+    if (!status) {
+        Display_printf(display, 0, 0, "I2C transfer fails!\n");
+    }
+
+    // RXD is at P5
+    i2cTransaction.slaveAddress = Board_TMP_ADDR;
+    i2cTransaction.writeBuf = NULL;
+    i2cTransaction.writeCount = 0;
     i2cTransaction.readBuf = &rxByte;
     i2cTransaction.readCount = 1;
     status = I2C_transfer(i2c, &i2cTransaction);
     if (!status) {
         Display_printf(display, 0, 0, "I2C transfer fails!\n");
     }
+    rxByte >>= 5;
     return rxByte;
 }
 
 void uart_write(I2C_Handle i2c, uint8_t txByte) {
     I2C_Transaction i2cTransaction;
     uint8_t         status;
+
     /* write to OUTPUT */
     txBuffer[0] = TCA6408a_OUTPUT;
+    i2cTransaction.slaveAddress = Board_TMP_ADDR;
+    i2cTransaction.writeBuf = txBuffer;
+    i2cTransaction.writeCount = 1;
+    i2cTransaction.readBuf = NULL;
+    i2cTransaction.readCount = 0;
+    status = I2C_transfer(i2c, &i2cTransaction);
+    if (!status) {
+        Display_printf(display, 0, 0, "I2C transfer fails!\n");
+    }
+
+    // TXD is at P6
+    txByte <<= 6;
     i2cTransaction.slaveAddress = Board_TMP_ADDR;
     i2cTransaction.writeBuf = &txByte;
     i2cTransaction.writeCount = 1;
@@ -110,16 +150,59 @@ void uart_write(I2C_Handle i2c, uint8_t txByte) {
     }
 }
 
+void invert_polarity(I2C_Handle i2c) {
+    I2C_Transaction i2cTransaction;
+    uint8_t         status;
+
+    /* write to POLARITY INVERSION register */
+    txBuffer[0] = TCA6408a_POLARITY;
+    i2cTransaction.slaveAddress = Board_TMP_ADDR;
+    i2cTransaction.writeBuf = txBuffer;
+    i2cTransaction.writeCount = 1;
+    i2cTransaction.readBuf = NULL;
+    i2cTransaction.readCount = 0;
+    status = I2C_transfer(i2c, &i2cTransaction);
+    if (!status) {
+        Display_printf(display, 0, 0, "I2C transfer fails!\n");
+    }
+    // write 1 to invert polarity
+    // RTS is at P0
+    txBuffer[0] = 0x1;
+    i2cTransaction.slaveAddress = Board_TMP_ADDR;
+    i2cTransaction.writeBuf = txBuffer;
+    i2cTransaction.writeCount = 1;
+    i2cTransaction.readBuf = NULL;
+    i2cTransaction.readCount = 0;
+    status = I2C_transfer(i2c, &i2cTransaction);
+    if (!status) {
+        Display_printf(display, 0, 0, "I2C transfer fails!\n");
+    }
+}
+
+int compare_response(uint8_t *data_receive) {
+    //compare received data to expect data
+    //TBD
+    return 1;
+}
+
+void timerCallback(GPTimerCC26XX_Handle handle, GPTimerCC26XX_IntMask interruptMask) {
+    // interrupt callback code goes here. Minimize processing in interrupt.
+    uart_ready = 1;
+}
+
 /*
  *  ======== mainThread ========
  */
 void *mainThread_6408a(void *arg0)
 {
-    uint8_t         i, data_val, err;
+    uint8_t         i, data_val, err, count;
+    uint8_t         data_length;
     I2C_Handle      i2c;
     I2C_Params      i2cParams;
     I2C_Transaction i2cTransaction;
     uint8_t         status;
+    GPTimerCC26XX_Params timerParams;
+    GPTimerCC26XX_Handle hTimer;
 
     /* Call driver init functions */
     Display_init();
@@ -162,8 +245,9 @@ void *mainThread_6408a(void *arg0)
     if (!status) {
         Display_printf(display, 0, 0, "I2C transfer fails!\n");
     }
-    /* config P0 as input, P1 as output */
-    txBuffer[0] = 0x01;
+    // config P5 as input(RXD), P6 as output,(TXD) P0 as output(rts), P1 as input(cts)
+    // bit set to 1 is configured as input, to 0 is configured as output
+    txBuffer[0] = 0x22;
     i2cTransaction.slaveAddress = Board_TMP_ADDR;
     i2cTransaction.writeBuf = txBuffer;
     i2cTransaction.writeCount = 1;
@@ -174,7 +258,52 @@ void *mainThread_6408a(void *arg0)
         Display_printf(display, 0, 0, "I2C transfer fails!\n");
     }
 
-    for (;;) {
+    // setup delay timer to let power stabilize before using the uart
+    uart_ready = 0;
+    GPTimerCC26XX_Params_init(&timerParams);
+    timerParams.mode = GPT_MODE_PERIODIC_UP;
+    timerParams.width = GPT_CONFIG_32BIT;
+    hTimer = GPTimerCC26XX_open(CC2640R2_LAUNCHXL_GPTIMER0A, &timerParams);
+    // one second period
+    GPTimerCC26XX_setLoadValue(hTimer, 47999999);
+    GPTimerCC26XX_registerInterrupt(hTimer, timerCallback, GPT_INT_TIMEOUT);
+    GPTimerCC26XX_start(hTimer);
+
+    while (uart_ready == 0);
+
+    data_length = sizeof(txCmd)/sizeof(uint8_t);
+    for (count = 0; count < data_length; count++) {
+        //activate RTS
+        invert_polarity(i2c);
+        //delay for 125 ms
+        uart_delay(DELAY_1_MS * 125);
+
+        // txCmd contains data to be sent to satellite chip
+        txPtr = &txCmd[i];
+
+        // transmit
+        // send start bit
+        uart_write(i2c, 0);
+        uart_delay(DELAY_US_1_0_BIT);
+        for (i = 0; i < 8; i++) {
+            //if (((*txPtr >> i) & 0x1) == 1) {
+            if (*txPtr & i) {
+                uart_write(i2c, 1);
+            }
+            else {
+                uart_write(i2c, 0);
+            }
+            uart_delay(DELAY_US_1_0_BIT);
+        }
+        // send stop bit
+        uart_write(i2c, 1);
+        uart_delay(DELAY_US_1_0_BIT);
+
+        //deactivate RTS
+        invert_polarity(i2c);
+        //delay for 25 ms
+        uart_delay(DELAY_1_MS * 25);
+
         // receive
         /* wait for start bit */
         while (uart_read(i2c) == 1);
@@ -182,7 +311,7 @@ void *mainThread_6408a(void *arg0)
         /* 1.5 bit delay */
         uart_delay(DELAY_US_1_5_BIT);
 
-        /* get byte */
+        /* read byte */
         for (i = 0; i < 8; i++) {
             if (uart_read(i2c) == 1) {
                 data_val |= (1 << i);
@@ -190,7 +319,7 @@ void *mainThread_6408a(void *arg0)
             uart_delay(DELAY_US_1_0_BIT);
         }
 
-        /* check for stop bit */
+        // check for stop bit
         if (uart_read(i2c) == 1)
             err = 0;
         else
@@ -198,28 +327,13 @@ void *mainThread_6408a(void *arg0)
 
         uart_delay(DELAY_US_0_5_BIT);
 
-        // transmit
         if (0 == err) {
-            // send start bit
-            uart_write(i2c, 0);
-            uart_delay(DELAY_US_1_0_BIT);
-            for (i = 0; i < 8; i++) {
-                //if (((data_val >> i) & 0x1) == 1) {
-                if (data_val & i) {
-                    uart_write(i2c, 1);
-                }
-                else {
-                    uart_write(i2c, 0);
-                }
-                uart_delay(DELAY_US_1_0_BIT);
-            }
-            // send stop bit
-            uart_write(i2c, 1);
-            uart_delay(DELAY_US_1_0_BIT);
+            // compare the response to expected
+            compare_response(&data_val);
         }
     }
 
-    /* Deinitialized I2C */
+    // Deinitialized I2C
     I2C_close(i2c);
     Display_printf(display, 0, 0, "I2C closed!\n");
 
